@@ -33,6 +33,13 @@ PawnPrivateTooltipName = "PawnPrivateTooltip1"
 local PawnItemCache
 local PawnItemCacheMaxSize = 200 -- thanks to bag arrows, this should be greater than the number of possible inventory slots
 
+-- On Classic versions, PawnGetItemData re-verifies its cache against a freshly parsed tooltip every time it's called, to work around
+-- an old game bug. Comparison tooltips (e.g. for rings and trinkets, which have two equipped slots and so show two comparison
+-- tooltips) can call into PawnGetItemData many times per second for the same item, so we throttle that re-verification here to avoid
+-- redoing the (comparatively expensive) tooltip parse more than a few times a second for the same item.
+local PawnItemDataLastVerifiedTime = {}
+local PawnItemDataVerificationThrottle = 0.5
+
 local PawnScaleTotals = { }
 
 
@@ -1348,6 +1355,14 @@ function PawnGetItemData(ItemLink)
 		if VgerCore.IsMainline then
 			return CachedItem
 		end
+		-- On Classic versions we normally re-verify the cache below on every call (see comment below), but if we already did that
+		-- very recently for this exact item, skip straight to using the cached item instead of re-parsing the tooltip again.
+		-- This matters a lot for items like rings and trinkets, which have two equipped slots and so can trigger this function
+		-- dozens of times a second while their comparison tooltips are visible.
+		local LastVerifiedTime = PawnItemDataLastVerifiedTime[ItemLink]
+		if LastVerifiedTime and (GetTime() - LastVerifiedTime) < PawnItemDataVerificationThrottle then
+			return CachedItem
+		end
 	end
 	-- If Item is non-null but Item.Values is null, we're not done yet!
 	local Item
@@ -1387,6 +1402,7 @@ function PawnGetItemData(ItemLink)
 					VgerCore.Message(VgerCore.Color.Green .. "    Cached item and this tooltip both had " .. Item.NumLines .. " lines, so using cached item")
 				end
 				if CachedItem.Values then
+					PawnItemDataLastVerifiedTime[ItemLink] = GetTime()
 					return CachedItem
 				end
 			else
@@ -1531,6 +1547,8 @@ function PawnGetItemData(ItemLink)
 
 	-- Recalculate the scale values for the item only if necessary.
 	PawnRecalculateItemValuesIfNecessary(Item)
+
+	if not VgerCore.IsMainline then PawnItemDataLastVerifiedTime[ItemLink] = GetTime() end
 
 	return Item
 end
