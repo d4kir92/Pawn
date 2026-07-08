@@ -33,13 +33,6 @@ PawnPrivateTooltipName = "PawnPrivateTooltip1"
 local PawnItemCache
 local PawnItemCacheMaxSize = 200 -- thanks to bag arrows, this should be greater than the number of possible inventory slots
 
--- On Classic versions, PawnGetItemData re-verifies its cache against a freshly parsed tooltip every time it's called, to work around
--- an old game bug. Comparison tooltips (e.g. for rings and trinkets, which have two equipped slots and so show two comparison
--- tooltips) can call into PawnGetItemData many times per second for the same item, so we throttle that re-verification here to avoid
--- redoing the (comparatively expensive) tooltip parse more than a few times a second for the same item.
-local PawnItemDataLastVerifiedTime = {}
-local PawnItemDataVerificationThrottle = 0.5
-
 local PawnScaleTotals = { }
 
 
@@ -1355,14 +1348,6 @@ function PawnGetItemData(ItemLink)
 		if VgerCore.IsMainline then
 			return CachedItem
 		end
-		-- On Classic versions we normally re-verify the cache below on every call (see comment below), but if we already did that
-		-- very recently for this exact item, skip straight to using the cached item instead of re-parsing the tooltip again.
-		-- This matters a lot for items like rings and trinkets, which have two equipped slots and so can trigger this function
-		-- dozens of times a second while their comparison tooltips are visible.
-		local LastVerifiedTime = PawnItemDataLastVerifiedTime[ItemLink]
-		if LastVerifiedTime and (GetTime() - LastVerifiedTime) < PawnItemDataVerificationThrottle then
-			return CachedItem
-		end
 	end
 	-- If Item is non-null but Item.Values is null, we're not done yet!
 	local Item
@@ -1392,20 +1377,33 @@ function PawnGetItemData(ItemLink)
 		end
 
 		-- First the enchanted stats.
-		Item.Stats, Item.SocketBonusStats, Item.UnknownLines, Item.PrettyLink = PawnGetStatsFromTooltipWithMethod(PawnPrivateTooltipName, true, "SetHyperlink", Item.Link)
-		Item.NumLines = (_G[PawnPrivateTooltipName]):NumLines()
-		if CachedItem then
-			-- Okay, we had already found this item in the cache, but we didn't know at the time if the cached version of the item is reliable. We'll consider it as reliable if the tooltip
+		-- Build the tooltip and check its line count first, which is cheap, before doing the (comparatively expensive) full
+		-- stat parse below. This still checks the live tooltip every single time--it never trusts a stale cache blindly--it
+		-- just skips redoing the expensive parsing work in the common case where the cheap check shows nothing has changed
+		-- since last time. This matters a lot for items like rings and trinkets, which have two equipped slots and so can
+		-- trigger this function dozens of times a second while their comparison tooltips are visible.
+		local PrivateTooltip = _G[PawnPrivateTooltipName]
+		PrivateTooltip:ClearLines() -- Without ClearLines, sometimes SetHyperlink seems to fail when called rapidly
+		PrivateTooltip:SetOwner(UIParent, "ANCHOR_NONE") -- Pawn 1.9.18: Curse user Bodar suggests reanchoring the tooltip to ensure that future updates work
+		PrivateTooltip:SetHyperlink(Item.Link)
+		Item.NumLines = PrivateTooltip:NumLines()
+
+		if CachedItem and CachedItem.Values and Item.NumLines == CachedItem.NumLines then
+			-- Okay, we had already found this item in the cache, but we didn't know at the time if the cached version of the item is reliable. We consider it reliable if the tooltip
 			-- now has the same number of lines as it did last time.
-			if Item.NumLines == CachedItem.NumLines then
-				if PawnCommon.DebugCache then
-					VgerCore.Message(VgerCore.Color.Green .. "    Cached item and this tooltip both had " .. Item.NumLines .. " lines, so using cached item")
-				end
-				if CachedItem.Values then
-					PawnItemDataLastVerifiedTime[ItemLink] = GetTime()
-					return CachedItem
-				end
-			else
+			if PawnCommon.DebugCache then
+				VgerCore.Message(VgerCore.Color.Green .. "    Cached item and this tooltip both had " .. Item.NumLines .. " lines, so using cached item")
+			end
+			return CachedItem
+		end
+
+		-- Either there's no fully-cached item yet, or the tooltip's line count changed since last time (for example, the game
+		-- finished populating stats that weren't ready yet before), so do the full (expensive) parse now.
+		PawnFixStupidTooltipFormatting(PawnPrivateTooltipName)
+		Item.Stats, Item.SocketBonusStats, Item.UnknownLines, Item.PrettyLink = PawnGetStatsFromTooltip(PawnPrivateTooltipName, true)
+
+		if CachedItem then
+			if Item.NumLines ~= CachedItem.NumLines then
 				-- The item in the cache has a different number of lines than this new item, so remove the old item from the cache, and then we'll add the new one later.
 				PawnUncacheItem(CachedItem)
 				if PawnCommon.DebugCache then
@@ -1547,8 +1545,6 @@ function PawnGetItemData(ItemLink)
 
 	-- Recalculate the scale values for the item only if necessary.
 	PawnRecalculateItemValuesIfNecessary(Item)
-
-	if not VgerCore.IsMainline then PawnItemDataLastVerifiedTime[ItemLink] = GetTime() end
 
 	return Item
 end
@@ -1794,7 +1790,6 @@ function PawnUpdateTooltip(TooltipName, MethodName, Param1, ...)
 				local LeftLine = _G[TooltipName .. "TextLeft" .. i]
 				if LeftLine then
 					local LeftLineText = LeftLine:GetText()
-					if issecretvalue and issecretvalue(LeftLineText) then break end -- If we hit any secrets before we're done, give up on reading.
 					if LeftLineText and LeftLineText ~= "" and (strfind(LeftLineText, ItemLevelSearchPattern1) or strfind(LeftLineText, ItemLevelSearchPattern2)) then
 						-- This is the line.  Add an arrow to the end.
 						AnnotatedItemLevel = true
@@ -2096,7 +2091,7 @@ function PawnFixStupidTooltipFormatting(TooltipName)
 		local LeftLine = _G[TooltipName .. "TextLeft" .. i]
 		local Text = LeftLine:GetText()
 		local Updated = false
-		if (not issecretvalue or not issecretvalue(Text)) and Text and strfind(Text, "\n", 1, true) ~= 1 then
+		if Text and strfind(Text, "\n", 1, true) ~= 1 then
 			-- First, look for a color.
 			if strfind(Text, "|cffffffff", 1, true) == 1 then
 				Text = strsub(Text, 11)
@@ -2227,7 +2222,7 @@ function PawnGetStatsFromTooltip(TooltipName, DebugMessages)
 	for i = ItemNameLineNumber + 1, Tooltip:NumLines() do
 		local LeftLine = _G[TooltipName .. "TextLeft" .. i]
 		local LeftLineText = LeftLine:GetText()
-		if (issecretvalue and issecretvalue(LeftLineText)) or not LeftLineText then break end
+		if not LeftLineText then break end
 
 		-- Look for this line in the "kill lines" list.  If it's there, we're done.
 		local IsKillLine = false
@@ -2257,7 +2252,7 @@ function PawnGetStatsFromTooltip(TooltipName, DebugMessages)
 			else
 				local RightLine = _G[TooltipName .. "TextRight" .. i]
 				CurrentParseText = RightLine:GetText()
-				if (issecretvalue and issecretvalue(ItemName)) or (not CurrentParseText) or (CurrentParseText == "") then break end
+				if (not CurrentParseText) or (CurrentParseText == "") then break end
 				RegexTable = PawnRightHandRegexes
 				CurrentDebugMessages = false
 				IgnoreErrors = true
@@ -2628,16 +2623,14 @@ function PawnGetItemNameFromTooltip(TooltipName)
 	local TooltipTopLine = _G[TooltipName .. "TextLeft1"]
 	if not TooltipTopLine then return end
 	local ItemName = TooltipTopLine:GetText()
-	if (issecretvalue and issecretvalue(ItemName)) or not ItemName or ItemName == "" or ItemName == RETRIEVING_ITEM_INFO then return end
+	if not ItemName or (issecretvalue and issecretvalue(ItemName)) or ItemName == "" or ItemName == RETRIEVING_ITEM_INFO then return end
 
 	-- If this is a Currently Equipped tooltip, skip the first line.
 	if ItemName == CURRENTLY_EQUIPPED then
 		ItemNameLineNumber = 2
 		TooltipTopLine = _G[TooltipName .. "TextLeft2"]
 		if not TooltipTopLine then return end
-		local TopLineName = TooltipTopLine:GetText()
-		if (issecretvalue and issecretvalue(TopLineName)) or not TopLineName then return end
-		return TopLineName, 2
+		return TooltipTopLine:GetText(), 2
 	end
 	return ItemName, 1
 end
@@ -2657,7 +2650,7 @@ function PawnAnnotateTooltipLines(TooltipName, Lines)
 		local LeftLine = _G[TooltipName .. "TextLeft" .. i]
 		if LeftLine then
 			local LeftLineText = LeftLine:GetText()
-			if (not issecretvalue or not issecretvalue(LeftLineText)) and Lines[LeftLineText] then
+			if Lines[LeftLineText] then
 				-- Getting the line text can fail in the following scenario, observable with MobInfo-2:
 				-- 1. Other mod modifies a tooltip to include unrecognized text.
 				-- 2. Pawn reads the tooltip, noting those unrecognized lines and remembering them so that they
@@ -4736,7 +4729,6 @@ function PawnAddRelicUpgradesToTooltip(TooltipName, UpgradeInfo)
 	for i = 1, Lines do
 		local LeftLine = _G[TooltipName .. "TextLeft" .. i]
 		local ArtifactName = LeftLine:GetText()
-		if (issecretvalue and issecretvalue(ArtifactName)) then return end
 
 		local ArtifactUpgradeInfo = UpgradeInfo[ArtifactName]
 		if ArtifactUpgradeInfo then
